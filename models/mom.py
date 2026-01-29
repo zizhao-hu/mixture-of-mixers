@@ -6,6 +6,10 @@
 #   - Channel Mixers: Mix information across the channel/feature dimension (D)
 #   - Router selects top-k experts from the pool
 #   - Weighted sum of selected expert outputs
+#
+# Key design: Each mixer type has its own normalization direction
+#   - Token Mixer: TokenNorm (normalizes across N dimension)
+#   - Channel Mixer: LayerNorm (normalizes across D dimension)
 
 import torch
 import torch.nn as nn
@@ -22,6 +26,61 @@ from .common import (
 
 
 #################################################################################
+#                              Normalization Layers                              #
+#################################################################################
+
+class TokenNorm(nn.Module):
+    """
+    Token-wise normalization: normalizes across the token/spatial dimension (N).
+    
+    For input (B, N, D), normalizes over dimension 1 (tokens).
+    Each channel is normalized independently across all spatial positions.
+    """
+    def __init__(self, num_tokens, eps=1e-6, elementwise_affine=True):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(num_tokens))
+            self.bias = nn.Parameter(torch.zeros(num_tokens))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+    
+    def forward(self, x):
+        # x: (B, N, D)
+        # Normalize over N dimension for each channel independently
+        x = x.transpose(1, 2)  # (B, D, N)
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        
+        if self.elementwise_affine:
+            x = x * self.weight + self.bias
+        
+        x = x.transpose(1, 2)  # (B, N, D)
+        return x
+
+
+class ChannelNorm(nn.Module):
+    """
+    Channel-wise normalization: normalizes across the channel/feature dimension (D).
+    
+    This is equivalent to standard LayerNorm over the last dimension.
+    For input (B, N, D), normalizes over dimension 2 (channels).
+    """
+    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, eps=eps, elementwise_affine=elementwise_affine)
+    
+    def forward(self, x):
+        # x: (B, N, D)
+        return self.norm(x)
+
+
+#################################################################################
 #                              Mixer Expert Modules                              #
 #################################################################################
 
@@ -30,10 +89,15 @@ class TokenMixer(nn.Module):
     Token Mixer: A 2-layer FFN that mixes across the token/spatial dimension.
     
     Input shape: (B, N, D)
-    Operation: Transpose to (B, D, N) -> FFN(N -> hidden -> N) -> Transpose back
+    Operation: 
+        1. TokenNorm (normalize across N)
+        2. Transpose to (B, D, N)
+        3. FFN(N -> hidden -> N)
+        4. Transpose back to (B, N, D)
     """
-    def __init__(self, num_tokens, hidden_ratio=4.0):
+    def __init__(self, num_tokens, hidden_size, hidden_ratio=4.0):
         super().__init__()
+        self.norm = TokenNorm(num_tokens, elementwise_affine=False)
         hidden_dim = int(num_tokens * hidden_ratio)
         self.fc1 = nn.Linear(num_tokens, hidden_dim)
         self.act = nn.GELU(approximate="tanh")
@@ -41,6 +105,7 @@ class TokenMixer(nn.Module):
     
     def forward(self, x):
         # x: (B, N, D)
+        x = self.norm(x)
         x = x.transpose(1, 2)  # (B, D, N)
         x = self.fc1(x)
         x = self.act(x)
@@ -54,10 +119,13 @@ class ChannelMixer(nn.Module):
     Channel Mixer: A 2-layer FFN that mixes across the channel/feature dimension.
     
     Input shape: (B, N, D)
-    Operation: FFN(D -> hidden -> D)
+    Operation:
+        1. ChannelNorm (normalize across D)
+        2. FFN(D -> hidden -> D)
     """
-    def __init__(self, hidden_size, hidden_ratio=4.0):
+    def __init__(self, num_tokens, hidden_size, hidden_ratio=4.0):
         super().__init__()
+        self.norm = ChannelNorm(hidden_size, elementwise_affine=False)
         hidden_dim = int(hidden_size * hidden_ratio)
         self.fc1 = nn.Linear(hidden_size, hidden_dim)
         self.act = nn.GELU(approximate="tanh")
@@ -65,6 +133,7 @@ class ChannelMixer(nn.Module):
     
     def forward(self, x):
         # x: (B, N, D)
+        x = self.norm(x)
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
@@ -78,6 +147,10 @@ class ChannelMixer(nn.Module):
 class MixtureOfMixers(nn.Module):
     """
     Mixture of Mixers: MoE-style routing over token and channel mixer experts.
+    
+    Each expert has its own normalization appropriate for its mixing direction:
+        - Token Mixers use TokenNorm (normalizes across spatial dimension)
+        - Channel Mixers use ChannelNorm (normalizes across feature dimension)
     
     Args:
         hidden_size: Feature dimension (D)
@@ -104,13 +177,13 @@ class MixtureOfMixers(nn.Module):
         self.num_experts = num_token_experts + num_channel_experts
         self.top_k = top_k
         
-        # Create experts
+        # Create experts (each with its own appropriate normalization)
         self.token_mixers = nn.ModuleList([
-            TokenMixer(num_tokens, hidden_ratio=mixer_hidden_ratio)
+            TokenMixer(num_tokens, hidden_size, hidden_ratio=mixer_hidden_ratio)
             for _ in range(num_token_experts)
         ])
         self.channel_mixers = nn.ModuleList([
-            ChannelMixer(hidden_size, hidden_ratio=mixer_hidden_ratio)
+            ChannelMixer(num_tokens, hidden_size, hidden_ratio=mixer_hidden_ratio)
             for _ in range(num_channel_experts)
         ])
         
@@ -181,7 +254,11 @@ class MixtureOfMixers(nn.Module):
 class MoMBlock(nn.Module):
     """
     MoM Block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    Replaces attention with MixtureOfMixers.
+    
+    Unlike DiT which uses a single LayerNorm before attention,
+    MoM delegates normalization to each expert (TokenNorm or ChannelNorm).
+    
+    The block still uses LayerNorm before the MLP (standard practice).
     """
     def __init__(
         self,
@@ -194,7 +271,7 @@ class MoMBlock(nn.Module):
         mixer_hidden_ratio=4.0,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # No norm1 here - each expert handles its own normalization
         self.mixer = MixtureOfMixers(
             hidden_size=hidden_size,
             num_tokens=num_tokens,
@@ -207,6 +284,9 @@ class MoMBlock(nn.Module):
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        
+        # adaLN modulation - 4 params for mixer (shift, scale, gate) + 3 for mlp
+        # Note: we still modulate the input to mixer, but norm is inside each expert
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -214,9 +294,15 @@ class MoMBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        mixer_out, aux_loss = self.mixer(modulate(self.norm1(x), shift_msa, scale_msa))
+        
+        # Modulate input before passing to mixer (mixer handles its own norm)
+        modulated_x = x * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        mixer_out, aux_loss = self.mixer(modulated_x)
         x = x + gate_msa.unsqueeze(1) * mixer_out
+        
+        # Standard MLP path with LayerNorm
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        
         return x, aux_loss
 
 
@@ -227,6 +313,13 @@ class MoMBlock(nn.Module):
 class MoM(nn.Module):
     """
     Mixture of Mixers (MoM): DiT with attention replaced by MoE-style mixers.
+    
+    Key differences from DiT:
+        - Attention replaced with MixtureOfMixers
+        - Each mixer expert has its own normalization:
+            - Token Mixers: TokenNorm (normalizes across spatial dim)
+            - Channel Mixers: ChannelNorm (normalizes across feature dim)
+        - Returns auxiliary loss for load balancing during training
     """
     def __init__(
         self,

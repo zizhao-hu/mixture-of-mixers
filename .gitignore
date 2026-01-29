@@ -1,5 +1,33 @@
-# Ignore everything in the assets directory
-assets/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
 
-# Ignore everything in the workdir directory
+# Environments
+.env
+.venv
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Project
+assets/
 workdir/
+results/
+logs/
+*.pt
+*.pth
+
+# Data
+data/
+*.tar
+*.zip
