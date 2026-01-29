@@ -1,6 +1,7 @@
 torch>=2.0.0
 torchvision>=0.15.0
-diffusers>=0.20.0
 timm>=0.9.0
+diffusers>=0.20.0
 numpy
 Pillow
+tqdm

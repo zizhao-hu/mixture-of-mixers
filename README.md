@@ -1,212 +1,95 @@
-# Mixture of Mixers
+# Mixture of Mixers (MoM)
 
-This repository contains a PyTorch implementation of Diffusion Transformers (DiT) for training on personal devices.
+A diffusion model architecture that replaces attention with **Mixture of Experts (MoE)** style token and channel mixers.
 
-Based on the [DiT paper](https://arxiv.org/abs/2212.09748) by Peebles & Xie.
+## Architecture
 
-## Model Variants
+MoM replaces the attention mechanism in DiT with a mixture of two types of experts:
 
-| Model | Depth | Hidden Size | Heads | Params |
-|-------|-------|-------------|-------|--------|
-| DiT-S/2 | 12 | 384 | 6 | ~33M |
-| DiT-S/4 | 12 | 384 | 6 | ~33M |
-| DiT-S/8 | 12 | 384 | 6 | ~33M |
-| DiT-B/2 | 12 | 768 | 12 | ~130M |
-| DiT-B/4 | 12 | 768 | 12 | ~130M |
-| DiT-L/2 | 24 | 1024 | 16 | ~458M |
-| DiT-XL/2 | 28 | 1152 | 16 | ~675M |
+- **Token Mixers**: 2-layer FFN that mixes across the spatial/token dimension (N)
+- **Channel Mixers**: 2-layer FFN that mixes across the feature/channel dimension (D)
 
-The `/2`, `/4`, `/8` suffix indicates patch size. Larger patch size = fewer tokens = faster training.
+A router selects top-k experts (default k=2) from the pool, and their outputs are combined via weighted sum.
 
-**Recommended for personal devices:** `DiT-S/4` or `DiT-S/8`
+```
+Input: (B, N, D)
+    │
+    ├─► Router ──► Select top-k experts
+    │
+    ├─► Token Mixer 1 ──┐
+    ├─► Token Mixer 2 ──┤
+    ├─► Token Mixer 3 ──┼──► Weighted Sum ──► Output: (B, N, D)
+    ├─► Token Mixer 4 ──┤
+    ├─► Channel Mixer 1 ┤
+    ├─► Channel Mixer 2 ┤
+    ├─► Channel Mixer 3 ┤
+    └─► Channel Mixer 4 ┘
+```
 
-## Setup
+## Installation
 
 ```bash
-# Create conda environment
-conda env create -f environment.yml
-conda activate DiT
-
-# Or install with pip
-pip install torch torchvision diffusers timm tqdm
+pip install torch torchvision timm diffusers
 ```
 
-## Datasets
+## Models
 
-### MS-COCO (Recommended for testing)
+| Model | Depth | Hidden Size | Patch Size |
+|-------|-------|-------------|------------|
+| MoM-S/4 | 12 | 384 | 4 |
+| MoM-B/4 | 12 | 768 | 4 |
+| MoM-L/4 | 24 | 1024 | 4 |
+| MoM-XL/4 | 28 | 1152 | 4 |
 
-Download and prepare MS-COCO dataset:
+Also includes baseline DiT models for comparison.
 
+## Training
+
+### Single GPU
 ```bash
-# Download validation set only (5K images, ~1GB) - good for quick testing
-python download_coco.py --output-dir ./data/coco --val-only
-
-# Download full training set (~18GB) + validation
-python download_coco.py --output-dir ./data/coco --include-val
+python train.py --data-path /path/to/imagenet/train --model MoM-S/4
 ```
 
-### ImageNet
-
-For ImageNet, organize your data in ImageFolder format:
-```
-imagenet/train/
-├── n01440764/
-│   ├── image1.JPEG
-│   └── ...
-└── ...
-```
-
-## Training (Single GPU)
-
-### On MS-COCO (80 classes)
-
+### Multi-GPU (DDP)
 ```bash
-# Quick test with COCO validation set
-python train_single_gpu.py --data-path ./data/coco/imagefolder/val --num-classes 80 --model DiT-S/4 --batch-size 16 --mixed-precision
-
-# Full training on COCO train set
-python train_single_gpu.py --data-path ./data/coco/imagefolder/train --num-classes 80 --model DiT-S/4 --batch-size 16 --epochs 100 --mixed-precision
+torchrun --nproc_per_node=2 train.py \
+    --data-path /path/to/imagenet/train \
+    --model MoM-S/4 \
+    --global-batch-size 256
 ```
 
-### On ImageNet (1000 classes)
-
+### SLURM Cluster
 ```bash
-# Train DiT-S/4 (recommended for personal devices)
-python train_single_gpu.py --data-path /path/to/imagenet/train --model DiT-S/4 --batch-size 16
-
-# With mixed precision (faster, less memory)
-python train_single_gpu.py --data-path /path/to/imagenet/train --model DiT-S/4 --batch-size 32 --mixed-precision
-
-# Resume from checkpoint
-python train_single_gpu.py --data-path /path/to/imagenet/train --resume results/000-DiT-S-4/checkpoints/0010000.pt
-```
-
-### Dataset Structure
-
-Your dataset should follow ImageFolder structure:
-```
-data/
-├── class1/
-│   ├── image1.jpg
-│   ├── image2.jpg
-│   └── ...
-├── class2/
-│   ├── image1.jpg
-│   └── ...
-└── ...
-```
-
-### Training Arguments
-
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--data-path` | required | Path to ImageFolder dataset |
-| `--model` | DiT-S/4 | Model variant |
-| `--image-size` | 256 | Image resolution (256 or 512) |
-| `--num-classes` | 1000 | Number of classes |
-| `--batch-size` | 16 | Batch size |
-| `--epochs` | 100 | Number of training epochs |
-| `--lr` | 1e-4 | Learning rate |
-| `--mixed-precision` | False | Use FP16 mixed precision |
-| `--ckpt-every` | 10000 | Save checkpoint every N steps |
-
-## Training (Multi-GPU with DDP)
-
-For distributed training on multiple GPUs:
-
-```bash
-torchrun --nnodes=1 --nproc_per_node=N train.py --model DiT-S/4 --data-path /path/to/data
-```
-
-## Multi-GPU Training (SLURM / HPC Clusters)
-
-### Setup
-
-```bash
-# Clone repo and setup environment
-git clone <your-repo-url> mixture-of-mixers
-cd mixture-of-mixers
-bash setup_env.sh
-```
-
-### Prepare Dataset
-
-```bash
-# Download COCO (full train + val, ~20GB)
-python download_coco.py --output-dir ./data/coco --include-val
-```
-
-### Submit Training Job
-
-```bash
-# Edit submit_slurm.sh first:
-# 1. Set DATA_PATH to your dataset location
-# 2. Set NUM_CLASSES (80 for COCO, 1000 for ImageNet)
-# 3. Adjust SLURM directives for your cluster
-
-# Submit job
 sbatch submit_slurm.sh
-
-# Monitor job
-squeue -u $USER
-tail -f logs/dit_<jobid>.out
-```
-
-### Or Run Locally with Multiple GPUs
-
-```bash
-# 2 GPUs
-torchrun --nproc_per_node=2 train_ddp.py \
-    --data-path ./data/coco/imagefolder/train \
-    --model DiT-S/4 \
-    --num-classes 80 \
-    --global-batch-size 128
-```
-
-### Expected Training Time (2x A100)
-
-| Dataset | Model | Epochs | Time |
-|---------|-------|--------|------|
-| COCO train (118K) | DiT-S/4 | 400 | ~16-24 hours |
-| COCO train (118K) | DiT-S/2 | 400 | ~2-3 days |
-| ImageNet (1.28M) | DiT-S/4 | 400 | ~4-5 days |
-
-### Output Structure
-
-Training automatically generates samples at every checkpoint:
-
-```
-results/000-DiT-S-4/
-├── log.txt                     # Training log
-├── checkpoints/
-│   ├── 0010000.pt             # Checkpoint at step 10K
-│   ├── 0020000.pt             # Checkpoint at step 20K
-│   └── final.pt               # Final checkpoint
-└── samples/
-    ├── step_0010000.png       # Samples at step 10K
-    ├── step_0020000.png       # Samples at step 20K
-    └── final.png              # Final samples
 ```
 
 ## Sampling
 
-Generate images from a trained model:
-
 ```bash
-python sample.py --model DiT-S/4 --ckpt /path/to/checkpoint.pt --image-size 256
+python sample.py --model MoM-S/4 --ckpt results/000-MoM-S-4/checkpoints/final.pt
+```
+
+## Project Structure
+
+```
+mixture-of-mixers/
+├── models/
+│   ├── __init__.py     # Model registry
+│   ├── common.py       # Shared components (embeddings, pos encoding)
+│   ├── dit.py          # DiT baseline
+│   └── mom.py          # Mixture of Mixers
+├── diffusion/          # Diffusion utilities
+├── train.py            # Unified training script
+├── sample.py           # Sampling script
+└── submit_slurm.sh     # SLURM job submission
 ```
 
 ## References
 
-```bibtex
-@article{Peebles2022DiT,
-  title={Scalable Diffusion Models with Transformers},
-  author={William Peebles and Saining Xie},
-  year={2022},
-  journal={arXiv preprint arXiv:2212.09748},
-}
-```
+- [DiT: Scalable Diffusion Models with Transformers](https://github.com/facebookresearch/DiT)
+- [MoE: Mixture of Experts](https://arxiv.org/abs/1701.06538)
+- [MLP-Mixer](https://arxiv.org/abs/2105.01601)
 
-## Acknowledgments
+## License
 
-This codebase is based on [facebookresearch/DiT](https://github.com/facebookresearch/DiT).
+See [LICENSE](LICENSE) for details.
