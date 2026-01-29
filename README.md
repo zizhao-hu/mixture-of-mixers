@@ -1,83 +1,212 @@
-## L-MLP <br> <sub><small>Official PyTorch implementation of [Lateralization MLP: A Simple Brain-inspired Architecture for Diffusion]</small></sub>
+# Mixture of Mixers
 
-The Transformer architecture has dominated machine learning in a wide range of tasks. The specific characteristic of this architecture is an expensive scaled dot-product attention mechanism that models the inter-token interactions, which is known to be the reason behind its success. However, such a mechanism does not have a direct parallel to the human brain which brings the question if the scaled-dot product is necessary for intelligence with strong expressive power. Inspired by the lateralization of the human brain, we propose a new simple but effective architecture called the Lateralization MLP (L-MLP). Stacking L-MLP blocks can generate complex architectures. Each L-MLP block is based on a multi-layer perceptron (MLP) that permutes data dimensions, processes each dimension in parallel, merges them, and finally passes through a joint MLP. We discover that this specific design outperforms other MLP variants and performs comparably to a transformer-based architecture in the challenging diffusion task while being highly efficient. We conduct experiments using text-to-image generation tasks  to demonstrate the effectiveness and efficiency of  L-MLP. Further, we look into the model behavior and discover a connection to the function of the human brain.
+This repository contains a PyTorch implementation of Diffusion Transformers (DiT) for training on personal devices.
 
---------------------
+Based on the [DiT paper](https://arxiv.org/abs/2212.09748) by Peebles & Xie.
 
-This codebase implements the L-MLP for diffusion models. Special thanks to [U-ViT](libs/uvit.py) for providing the amazing codebase.
+## Model Variants
 
+| Model | Depth | Hidden Size | Heads | Params |
+|-------|-------|-------------|-------|--------|
+| DiT-S/2 | 12 | 384 | 6 | ~33M |
+| DiT-S/4 | 12 | 384 | 6 | ~33M |
+| DiT-S/8 | 12 | 384 | 6 | ~33M |
+| DiT-B/2 | 12 | 768 | 12 | ~130M |
+| DiT-B/4 | 12 | 768 | 12 | ~130M |
+| DiT-L/2 | 24 | 1024 | 16 | ~458M |
+| DiT-XL/2 | 28 | 1152 | 16 | ~675M |
 
-## Dependency
+The `/2`, `/4`, `/8` suffix indicates patch size. Larger patch size = fewer tokens = faster training.
 
-```sh
-pip install torch torchvision --extra-index-url https://download.pytorch.org/whl/cu116  # install torch-1.13.1
-pip install accelerate==0.12.0 absl-py ml_collections einops ftfy==6.1.1 transformers==4.23.1
+**Recommended for personal devices:** `DiT-S/4` or `DiT-S/8`
+
+## Setup
+
+```bash
+# Create conda environment
+conda env create -f environment.yml
+conda activate DiT
+
+# Or install with pip
+pip install torch torchvision diffusers timm tqdm
 ```
 
-* This repo is based on [`timm==0.3.2`](https://github.com/rwightman/pytorch-image-models), for which a [fix](https://github.com/rwightman/pytorch-image-models/issues/420#issuecomment-776459842) is needed to work with PyTorch 1.8.1+. (Perhaps other versions also work, but I haven't tested it.)
+## Datasets
 
-## Preparation Before Training and Evaluation
+### MS-COCO (Recommended for testing)
 
-#### Autoencoder
-Download `stable-diffusion` directory from this [link](https://drive.google.com/drive/folders/1yo-XhqbPue3rp5P57j6QbA5QZx6KybvP?usp=sharing) (which contains image autoencoders converted from [Stable Diffusion](https://github.com/CompVis/stable-diffusion)). 
-Put the downloaded directory as `assets/stable-diffusion` in this codebase.
-The autoencoders are used in latent diffusion models.
+Download and prepare MS-COCO dataset:
 
-#### Data
-* MS-COCO: Download COCO 2014 [training](http://images.cocodataset.org/zips/train2014.zip), [validation](http://images.cocodataset.org/zips/val2014.zip) data and [annotations](http://images.cocodataset.org/annotations/annotations_trainval2014.zip). Then extract their features according to `scripts/extract_mscoco_feature.py` `scripts/extract_test_prompt_feature.py` `scripts/extract_empty_feature.py`.
+```bash
+# Download validation set only (5K images, ~1GB) - good for quick testing
+python download_coco.py --output-dir ./data/coco --val-only
 
-#### Reference statistics for FID
-Download `fid_stats` directory from this [link](https://drive.google.com/drive/folders/1yo-XhqbPue3rp5P57j6QbA5QZx6KybvP?usp=sharing) (which contains reference statistics for FID).
-Put the downloaded directory as `assets/fid_stats` in this codebase.
-In addition to evaluation, these reference statistics are used to monitor FID during the training process.
-
-## Training
-
-We use the [huggingface accelerate](https://github.com/huggingface/accelerate) library to help train with distributed data parallel and mixed precision. The following is the training command:
-```sh
-# the training setting
-num_processes=2  # the number of gpus you have, e.g., 2
-train_script=train_t2i_discrete.py # train_t2i_discrete.py: text-to-image training on latent space
-config=configs/f2.py  # the training configuration, you can change other hyperparameters by modifying the configuration file
-
-# launch training
-accelerate launch --multi_gpu --num_processes $num_processes --mixed_precision fp16 $train_script --config=$config
+# Download full training set (~18GB) + validation
+python download_coco.py --output-dir ./data/coco --include-val
 ```
 
-We provide command to reproduce L-MLP training in the paper:
-```sh
+### ImageNet
 
-# MS-COCO (U-MLP)
-accelerate launch --num_processes 1 --mixed_precision fp16 train_t2i_discrete.py --config=configs/lmlp_f2.py
-
-# MS-COCO (U-ViT-S/2) (baseline)
-accelerate launch --num_processes 1 --mixed_precision fp16 train_t2i_discrete.py --config=configs/mscoco_uvit_small.py
-
+For ImageNet, organize your data in ImageFolder format:
+```
+imagenet/train/
+├── n01440764/
+│   ├── image1.JPEG
+│   └── ...
+└── ...
 ```
 
-## Evaluation (Compute FID)
+## Training (Single GPU)
 
-We use the [huggingface accelerate](https://github.com/huggingface/accelerate) library for efficient inference with mixed precision and multiple gpus. The following is the evaluation command:
-```sh
-# the evaluation setting
-num_processes=1  # the number of gpus you have, e.g., 2
-eval_script=eval_t2i_discrete.py  # for models trained with train_t2i_discrete.py (i.e., text-to-image models on latent space)
-config=configs/lmlp_f2.py  # the training configuration
+### On MS-COCO (80 classes)
 
-# launch evaluation
-accelerate launch --num_processes $num_processes --mixed_precision fp16 eval_script --config=$config
+```bash
+# Quick test with COCO validation set
+python train_single_gpu.py --data-path ./data/coco/imagefolder/val --num-classes 80 --model DiT-S/4 --batch-size 16 --mixed-precision
+
+# Full training on COCO train set
+python train_single_gpu.py --data-path ./data/coco/imagefolder/train --num-classes 80 --model DiT-S/4 --batch-size 16 --epochs 100 --mixed-precision
 ```
 
-We provide all commands to reproduce FID results in the paper:
-```sh
-# MS-COCO (U-MLP)
-accelerate launch --num_processes 1 --mixed_precision fp16 eval_t2i_discrete.py --config=configs/lmlp_f2.py --nnet_path=nnet_ema.pth
+### On ImageNet (1000 classes)
+
+```bash
+# Train DiT-S/4 (recommended for personal devices)
+python train_single_gpu.py --data-path /path/to/imagenet/train --model DiT-S/4 --batch-size 16
+
+# With mixed precision (faster, less memory)
+python train_single_gpu.py --data-path /path/to/imagenet/train --model DiT-S/4 --batch-size 32 --mixed-precision
+
+# Resume from checkpoint
+python train_single_gpu.py --data-path /path/to/imagenet/train --resume results/000-DiT-S-4/checkpoints/0010000.pt
+```
+
+### Dataset Structure
+
+Your dataset should follow ImageFolder structure:
+```
+data/
+├── class1/
+│   ├── image1.jpg
+│   ├── image2.jpg
+│   └── ...
+├── class2/
+│   ├── image1.jpg
+│   └── ...
+└── ...
+```
+
+### Training Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--data-path` | required | Path to ImageFolder dataset |
+| `--model` | DiT-S/4 | Model variant |
+| `--image-size` | 256 | Image resolution (256 or 512) |
+| `--num-classes` | 1000 | Number of classes |
+| `--batch-size` | 16 | Batch size |
+| `--epochs` | 100 | Number of training epochs |
+| `--lr` | 1e-4 | Learning rate |
+| `--mixed-precision` | False | Use FP16 mixed precision |
+| `--ckpt-every` | 10000 | Save checkpoint every N steps |
+
+## Training (Multi-GPU with DDP)
+
+For distributed training on multiple GPUs:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N train.py --model DiT-S/4 --data-path /path/to/data
+```
+
+## Multi-GPU Training (SLURM / HPC Clusters)
+
+### Setup
+
+```bash
+# Clone repo and setup environment
+git clone <your-repo-url> mixture-of-mixers
+cd mixture-of-mixers
+bash setup_env.sh
+```
+
+### Prepare Dataset
+
+```bash
+# Download COCO (full train + val, ~20GB)
+python download_coco.py --output-dir ./data/coco --include-val
+```
+
+### Submit Training Job
+
+```bash
+# Edit submit_slurm.sh first:
+# 1. Set DATA_PATH to your dataset location
+# 2. Set NUM_CLASSES (80 for COCO, 1000 for ImageNet)
+# 3. Adjust SLURM directives for your cluster
+
+# Submit job
+sbatch submit_slurm.sh
+
+# Monitor job
+squeue -u $USER
+tail -f logs/dit_<jobid>.out
+```
+
+### Or Run Locally with Multiple GPUs
+
+```bash
+# 2 GPUs
+torchrun --nproc_per_node=2 train_ddp.py \
+    --data-path ./data/coco/imagefolder/train \
+    --model DiT-S/4 \
+    --num-classes 80 \
+    --global-batch-size 128
+```
+
+### Expected Training Time (2x A100)
+
+| Dataset | Model | Epochs | Time |
+|---------|-------|--------|------|
+| COCO train (118K) | DiT-S/4 | 400 | ~16-24 hours |
+| COCO train (118K) | DiT-S/2 | 400 | ~2-3 days |
+| ImageNet (1.28M) | DiT-S/4 | 400 | ~4-5 days |
+
+### Output Structure
+
+Training automatically generates samples at every checkpoint:
+
+```
+results/000-DiT-S-4/
+├── log.txt                     # Training log
+├── checkpoints/
+│   ├── 0010000.pt             # Checkpoint at step 10K
+│   ├── 0020000.pt             # Checkpoint at step 20K
+│   └── final.pt               # Final checkpoint
+└── samples/
+    ├── step_0010000.png       # Samples at step 10K
+    ├── step_0020000.png       # Samples at step 20K
+    └── final.png              # Final samples
+```
+
+## Sampling
+
+Generate images from a trained model:
+
+```bash
+python sample.py --model DiT-S/4 --ckpt /path/to/checkpoint.pt --image-size 256
 ```
 
 ## References
 
-This implementation is based on
-* [U-ViT](https://github.com/baofff/U-ViT) (provide the code base for experiments)
-* [guided-diffusion](https://github.com/openai/guided-diffusion) (provide the FID reference statistics on ImageNet)
-* [pytorch-fid](https://github.com/mseitzer/pytorch-fid) (provide the official implementation of FID to PyTorch)
-* [dpm-solver](https://github.com/LuChengTHU/dpm-solver) (provide the sampler)
+```bibtex
+@article{Peebles2022DiT,
+  title={Scalable Diffusion Models with Transformers},
+  author={William Peebles and Saining Xie},
+  year={2022},
+  journal={arXiv preprint arXiv:2212.09748},
+}
+```
+
+## Acknowledgments
+
+This codebase is based on [facebookresearch/DiT](https://github.com/facebookresearch/DiT).

@@ -1,8 +1,0 @@
-'A group of skiers are preparing to ski down a mountain.'
-'A small kitchen with a low ceiling.'
-'A group of elephants walking in muddy water.'
-'A living area with a television and a table.'
-'A bus driving in a city area with traffic signs.'
-'A baseball player taking a swing at an incoming ball.',
-'A city street line with brick buildings and trees.',
-'A close up of a plate of broccoli and sauce.',
