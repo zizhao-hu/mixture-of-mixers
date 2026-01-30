@@ -1,15 +1,11 @@
 # Mixture of Mixers (MoM)
-# A DiT variant replacing attention with MoE-style token/channel mixers
+# Attention replacement using MoE-style token mixers
 #
 # Architecture:
-#   - Token Mixers: Mix information across the token/spatial dimension (N)
-#   - Channel Mixers: Mix information across the channel/feature dimension (D)
-#   - Router selects top-k experts from the pool
-#   - Weighted sum of selected expert outputs
-#
-# Key design: Each mixer type has its own normalization direction
-#   - Token Mixer: TokenNorm (normalizes across N dimension)
-#   - Channel Mixer: LayerNorm (normalizes across D dimension)
+#   - Token Mixers: 2-layer MLP mixing across the token/spatial dimension (N)
+#   - Normalization along token dimension before mixing
+#   - Router selects top-k experts
+#   - Output projection after weighted sum
 
 import torch
 import torch.nn as nn
@@ -26,78 +22,22 @@ from .common import (
 
 
 #################################################################################
-#                              Normalization Layers                              #
-#################################################################################
-
-class TokenNorm(nn.Module):
-    """
-    Token-wise normalization: normalizes across the token/spatial dimension (N).
-    
-    For input (B, N, D), normalizes over dimension 1 (tokens).
-    Each channel is normalized independently across all spatial positions.
-    """
-    def __init__(self, num_tokens, eps=1e-6, elementwise_affine=True):
-        super().__init__()
-        self.num_tokens = num_tokens
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        
-        if elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(num_tokens))
-            self.bias = nn.Parameter(torch.zeros(num_tokens))
-        else:
-            self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
-    
-    def forward(self, x):
-        # x: (B, N, D)
-        # Normalize over N dimension for each channel independently
-        x = x.transpose(1, 2)  # (B, D, N)
-        mean = x.mean(dim=-1, keepdim=True)
-        var = x.var(dim=-1, keepdim=True, unbiased=False)
-        x = (x - mean) / torch.sqrt(var + self.eps)
-        
-        if self.elementwise_affine:
-            x = x * self.weight + self.bias
-        
-        x = x.transpose(1, 2)  # (B, N, D)
-        return x
-
-
-class ChannelNorm(nn.Module):
-    """
-    Channel-wise normalization: normalizes across the channel/feature dimension (D).
-    
-    This is equivalent to standard LayerNorm over the last dimension.
-    For input (B, N, D), normalizes over dimension 2 (channels).
-    """
-    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
-        super().__init__()
-        self.norm = nn.LayerNorm(hidden_size, eps=eps, elementwise_affine=elementwise_affine)
-    
-    def forward(self, x):
-        # x: (B, N, D)
-        return self.norm(x)
-
-
-#################################################################################
-#                              Mixer Expert Modules                              #
+#                              Token Mixer Expert                                #
 #################################################################################
 
 class TokenMixer(nn.Module):
     """
-    Token Mixer: A 2-layer FFN that mixes across the token/spatial dimension.
+    Token Mixer: 2-layer MLP mixing across token/spatial dimension.
     
     Input shape: (B, N, D)
     Operation: 
-        1. TokenNorm (normalize across N)
+        1. Normalize along token dim (dim=1)
         2. Transpose to (B, D, N)
-        3. FFN(N -> hidden -> N)
+        3. MLP: N -> hidden -> N
         4. Transpose back to (B, N, D)
     """
-    def __init__(self, num_tokens, hidden_size, hidden_ratio=4.0):
+    def __init__(self, num_tokens, hidden_size, hidden_ratio=1.0):
         super().__init__()
-        self.norm = TokenNorm(num_tokens, elementwise_affine=False)
         hidden_dim = int(num_tokens * hidden_ratio)
         self.fc1 = nn.Linear(num_tokens, hidden_dim)
         self.act = nn.GELU(approximate="tanh")
@@ -105,7 +45,9 @@ class TokenMixer(nn.Module):
     
     def forward(self, x):
         # x: (B, N, D)
-        x = self.norm(x)
+        # Normalize along token dimension
+        x = F.layer_norm(x.transpose(1, 2), [x.size(1)]).transpose(1, 2)
+        
         x = x.transpose(1, 2)  # (B, D, N)
         x = self.fc1(x)
         x = self.act(x)
@@ -114,81 +56,63 @@ class TokenMixer(nn.Module):
         return x
 
 
-class ChannelMixer(nn.Module):
-    """
-    Channel Mixer: A 2-layer FFN that mixes across the channel/feature dimension.
-    
-    Input shape: (B, N, D)
-    Operation:
-        1. ChannelNorm (normalize across D)
-        2. FFN(D -> hidden -> D)
-    """
-    def __init__(self, num_tokens, hidden_size, hidden_ratio=4.0):
-        super().__init__()
-        self.norm = ChannelNorm(hidden_size, elementwise_affine=False)
-        hidden_dim = int(hidden_size * hidden_ratio)
-        self.fc1 = nn.Linear(hidden_size, hidden_dim)
-        self.act = nn.GELU(approximate="tanh")
-        self.fc2 = nn.Linear(hidden_dim, hidden_size)
-    
-    def forward(self, x):
-        # x: (B, N, D)
-        x = self.norm(x)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return x
-
-
 #################################################################################
-#                           Mixture of Mixers (MoE Layer)                        #
+#                    Mixture of Mixers (Attention Replacement)                   #
 #################################################################################
 
 class MixtureOfMixers(nn.Module):
     """
-    Mixture of Mixers: MoE-style routing over token and channel mixer experts.
+    Mixture of Mixers: Drop-in attention replacement using MoE token mixers.
     
-    Each expert has its own normalization appropriate for its mixing direction:
-        - Token Mixers use TokenNorm (normalizes across spatial dimension)
-        - Channel Mixers use ChannelNorm (normalizes across feature dimension)
+    Auto-computes num_experts and top_k to match attention parameters:
+        - top_k selected so active params ≈ attention params (4D²)
+        - num_experts = 10 × top_k (sparse MoE)
     
     Args:
         hidden_size: Feature dimension (D)
         num_tokens: Number of tokens (N)
-        num_token_experts: Number of token mixer experts
-        num_channel_experts: Number of channel mixer experts
-        top_k: Number of experts to select per input
-        mixer_hidden_ratio: Hidden layer ratio for mixers
+        hidden_ratio: Hidden ratio for token mixer MLPs
     """
     def __init__(
         self,
         hidden_size,
         num_tokens,
-        num_token_experts=4,
-        num_channel_experts=4,
-        top_k=2,
-        mixer_hidden_ratio=4.0,
+        hidden_ratio=1.0,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_tokens = num_tokens
-        self.num_token_experts = num_token_experts
-        self.num_channel_experts = num_channel_experts
-        self.num_experts = num_token_experts + num_channel_experts
+        self.hidden_ratio = hidden_ratio
+        
+        # Auto-compute top_k to match attention params (4D²)
+        # Active params: top_k experts + out_proj + router
+        #   - Experts: top_k × 2 × hidden_ratio × N²
+        #   - Out proj: D²
+        #   - Router: num_experts × D = 10 × top_k × D
+        # Target: 4D² (attention = Wq, Wk, Wv, Wo)
+        # top_k × (2 × hidden_ratio × N² + 10D) + D² ≤ 4D²
+        # top_k ≤ 3D² / (2 × hidden_ratio × N² + 10D)
+        D, N = hidden_size, num_tokens
+        top_k = int(3 * D**2 / (2 * hidden_ratio * N**2 + 10 * D))  # floor
+        top_k = max(1, top_k)  # At least 1 expert
+        
+        # Total experts = 10 × selected experts
+        num_experts = 10 * top_k
+        
+        self.num_experts = num_experts
         self.top_k = top_k
         
-        # Create experts (each with its own appropriate normalization)
-        self.token_mixers = nn.ModuleList([
-            TokenMixer(num_tokens, hidden_size, hidden_ratio=mixer_hidden_ratio)
-            for _ in range(num_token_experts)
-        ])
-        self.channel_mixers = nn.ModuleList([
-            ChannelMixer(num_tokens, hidden_size, hidden_ratio=mixer_hidden_ratio)
-            for _ in range(num_channel_experts)
+        # Token mixer experts
+        self.experts = nn.ModuleList([
+            TokenMixer(num_tokens, hidden_size, hidden_ratio=hidden_ratio)
+            for _ in range(num_experts)
         ])
         
         # Router
-        self.router = nn.Linear(hidden_size, self.num_experts, bias=False)
+        self.router = nn.Linear(hidden_size, num_experts, bias=False)
+        
+        # Output projection
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
         
     def forward(self, x):
         """
@@ -201,7 +125,7 @@ class MixtureOfMixers(nn.Module):
         """
         B, N, D = x.shape
         
-        # Compute routing scores (global average pooling for routing decision)
+        # Compute routing scores
         router_input = x.mean(dim=1)  # (B, D)
         router_logits = self.router(router_input)  # (B, num_experts)
         router_probs = F.softmax(router_logits, dim=-1)
@@ -214,7 +138,6 @@ class MixtureOfMixers(nn.Module):
         output = torch.zeros_like(x)
         
         for expert_idx in range(self.num_experts):
-            # Find samples that selected this expert
             mask = (top_k_indices == expert_idx)
             weights = (top_k_weights * mask.float()).sum(dim=-1)
             active = weights > 0
@@ -222,24 +145,21 @@ class MixtureOfMixers(nn.Module):
             if not active.any():
                 continue
             
-            # Compute expert output for active samples
             active_x = x[active]
             active_weights = weights[active].view(-1, 1, 1)
-            
-            if expert_idx < self.num_token_experts:
-                expert_out = self.token_mixers[expert_idx](active_x)
-            else:
-                expert_out = self.channel_mixers[expert_idx - self.num_token_experts](active_x)
-            
+            expert_out = self.experts[expert_idx](active_x)
             output[active] += active_weights * expert_out
         
-        # Load balancing auxiliary loss
+        # Output projection
+        output = self.out_proj(output)
+        
+        # Load balancing loss
         aux_loss = self._load_balancing_loss(router_probs, top_k_indices)
         
         return output, aux_loss
     
     def _load_balancing_loss(self, router_probs, top_k_indices):
-        """Compute load balancing loss to encourage even expert usage."""
+        """Load balancing loss to encourage even expert usage."""
         top1_indices = top_k_indices[:, 0]
         expert_mask = F.one_hot(top1_indices, num_classes=self.num_experts).float()
         expert_probs = router_probs.mean(dim=0)
@@ -248,79 +168,52 @@ class MixtureOfMixers(nn.Module):
 
 
 #################################################################################
-#                              MoM Block                                         #
+#                         DiT-MoM Block (for Diffusion)                          #
 #################################################################################
 
-class MoMBlock(nn.Module):
-    """
-    MoM Block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    
-    Unlike DiT which uses a single LayerNorm before attention,
-    MoM delegates normalization to each expert (TokenNorm or ChannelNorm).
-    
-    The block still uses LayerNorm before the MLP (standard practice).
-    """
+class DiT_MoMBlock(nn.Module):
+    """DiT block with MoM replacing attention."""
     def __init__(
         self,
         hidden_size,
         num_tokens,
-        num_token_experts=4,
-        num_channel_experts=4,
-        top_k=2,
+        hidden_ratio=1.0,
         mlp_ratio=4.0,
-        mixer_hidden_ratio=4.0,
     ):
         super().__init__()
-        # No norm1 here - each expert handles its own normalization
-        self.mixer = MixtureOfMixers(
+        self.mom = MixtureOfMixers(
             hidden_size=hidden_size,
             num_tokens=num_tokens,
-            num_token_experts=num_token_experts,
-            num_channel_experts=num_channel_experts,
-            top_k=top_k,
-            mixer_hidden_ratio=mixer_hidden_ratio,
+            hidden_ratio=hidden_ratio,
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         
-        # adaLN modulation - 4 params for mixer (shift, scale, gate) + 3 for mlp
-        # Note: we still modulate the input to mixer, but norm is inside each expert
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        shift_mom, scale_mom, gate_mom, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         
-        # Modulate input before passing to mixer (mixer handles its own norm)
-        modulated_x = x * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        mixer_out, aux_loss = self.mixer(modulated_x)
-        x = x + gate_msa.unsqueeze(1) * mixer_out
+        modulated_x = x * (1 + scale_mom.unsqueeze(1)) + shift_mom.unsqueeze(1)
+        mom_out, aux_loss = self.mom(modulated_x)
+        x = x + gate_mom.unsqueeze(1) * mom_out
         
-        # Standard MLP path with LayerNorm
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         
         return x, aux_loss
 
 
 #################################################################################
-#                            Mixture of Mixers Model                             #
+#                         DiT-MoM Model (Diffusion Transformer)                  #
 #################################################################################
 
-class MoM(nn.Module):
-    """
-    Mixture of Mixers (MoM): DiT with attention replaced by MoE-style mixers.
-    
-    Key differences from DiT:
-        - Attention replaced with MixtureOfMixers
-        - Each mixer expert has its own normalization:
-            - Token Mixers: TokenNorm (normalizes across spatial dim)
-            - Channel Mixers: ChannelNorm (normalizes across feature dim)
-        - Returns auxiliary loss for load balancing during training
-    """
+class DiT_MoM(nn.Module):
+    """Diffusion Transformer with Mixture of Mixers."""
     def __init__(
         self,
         input_size=32,
@@ -328,11 +221,8 @@ class MoM(nn.Module):
         in_channels=4,
         hidden_size=1152,
         depth=28,
-        num_token_experts=4,
-        num_channel_experts=4,
-        top_k=2,
+        hidden_ratio=1.0,
         mlp_ratio=4.0,
-        mixer_hidden_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
@@ -353,14 +243,11 @@ class MoM(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            MoMBlock(
+            DiT_MoMBlock(
                 hidden_size=hidden_size,
                 num_tokens=num_patches,
-                num_token_experts=num_token_experts,
-                num_channel_experts=num_channel_experts,
-                top_k=top_k,
+                hidden_ratio=hidden_ratio,
                 mlp_ratio=mlp_ratio,
-                mixer_hidden_ratio=mixer_hidden_ratio,
             ) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -405,18 +292,6 @@ class MoM(nn.Module):
         return imgs
 
     def forward(self, x, t, y):
-        """
-        Forward pass of MoM.
-        
-        Args:
-            x: (B, C, H, W) tensor of spatial inputs
-            t: (B,) tensor of diffusion timesteps
-            y: (B,) tensor of class labels
-        
-        Returns:
-            output: (B, out_channels, H, W)
-            aux_loss: Load balancing auxiliary loss
-        """
         x = self.x_embedder(x) + self.pos_embed
         t = self.t_embedder(t)
         y = self.y_embedder(y, self.training)
@@ -433,7 +308,6 @@ class MoM(nn.Module):
         return x, total_aux_loss / self.depth
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
-        """Forward pass with classifier-free guidance."""
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out, _ = self.forward(combined, t, y)
@@ -445,49 +319,53 @@ class MoM(nn.Module):
 
 
 #################################################################################
-#                                 MoM Configs                                    #
+#                              DiT-MoM Configs                                   #
 #################################################################################
 
-def MoM_XL_2(**kwargs):
-    return MoM(depth=28, hidden_size=1152, patch_size=2, **kwargs)
+def DiT_MoM_XL_2(**kwargs):
+    return DiT_MoM(depth=28, hidden_size=1152, patch_size=2, **kwargs)
 
-def MoM_XL_4(**kwargs):
-    return MoM(depth=28, hidden_size=1152, patch_size=4, **kwargs)
+def DiT_MoM_XL_4(**kwargs):
+    return DiT_MoM(depth=28, hidden_size=1152, patch_size=4, **kwargs)
 
-def MoM_XL_8(**kwargs):
-    return MoM(depth=28, hidden_size=1152, patch_size=8, **kwargs)
+def DiT_MoM_XL_8(**kwargs):
+    return DiT_MoM(depth=28, hidden_size=1152, patch_size=8, **kwargs)
 
-def MoM_L_2(**kwargs):
-    return MoM(depth=24, hidden_size=1024, patch_size=2, **kwargs)
+def DiT_MoM_L_2(**kwargs):
+    return DiT_MoM(depth=24, hidden_size=1024, patch_size=2, **kwargs)
 
-def MoM_L_4(**kwargs):
-    return MoM(depth=24, hidden_size=1024, patch_size=4, **kwargs)
+def DiT_MoM_L_4(**kwargs):
+    return DiT_MoM(depth=24, hidden_size=1024, patch_size=4, **kwargs)
 
-def MoM_L_8(**kwargs):
-    return MoM(depth=24, hidden_size=1024, patch_size=8, **kwargs)
+def DiT_MoM_L_8(**kwargs):
+    return DiT_MoM(depth=24, hidden_size=1024, patch_size=8, **kwargs)
 
-def MoM_B_2(**kwargs):
-    return MoM(depth=12, hidden_size=768, patch_size=2, **kwargs)
+def DiT_MoM_B_2(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=768, patch_size=2, **kwargs)
 
-def MoM_B_4(**kwargs):
-    return MoM(depth=12, hidden_size=768, patch_size=4, **kwargs)
+def DiT_MoM_B_4(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=768, patch_size=4, **kwargs)
 
-def MoM_B_8(**kwargs):
-    return MoM(depth=12, hidden_size=768, patch_size=8, **kwargs)
+def DiT_MoM_B_8(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=768, patch_size=8, **kwargs)
 
-def MoM_S_2(**kwargs):
-    return MoM(depth=12, hidden_size=384, patch_size=2, **kwargs)
+def DiT_MoM_S_2(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=384, patch_size=2, **kwargs)
 
-def MoM_S_4(**kwargs):
-    return MoM(depth=12, hidden_size=384, patch_size=4, **kwargs)
+def DiT_MoM_S_4(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=384, patch_size=4, **kwargs)
 
-def MoM_S_8(**kwargs):
-    return MoM(depth=12, hidden_size=384, patch_size=8, **kwargs)
+def DiT_MoM_S_8(**kwargs):
+    return DiT_MoM(depth=12, hidden_size=384, patch_size=8, **kwargs)
 
 
-MoM_models = {
-    'MoM-XL/2': MoM_XL_2,  'MoM-XL/4': MoM_XL_4,  'MoM-XL/8': MoM_XL_8,
-    'MoM-L/2':  MoM_L_2,   'MoM-L/4':  MoM_L_4,   'MoM-L/8':  MoM_L_8,
-    'MoM-B/2':  MoM_B_2,   'MoM-B/4':  MoM_B_4,   'MoM-B/8':  MoM_B_8,
-    'MoM-S/2':  MoM_S_2,   'MoM-S/4':  MoM_S_4,   'MoM-S/8':  MoM_S_8,
+DiT_MoM_models = {
+    'DiT-MoM-XL/2': DiT_MoM_XL_2,  'DiT-MoM-XL/4': DiT_MoM_XL_4,  'DiT-MoM-XL/8': DiT_MoM_XL_8,
+    'DiT-MoM-L/2':  DiT_MoM_L_2,   'DiT-MoM-L/4':  DiT_MoM_L_4,   'DiT-MoM-L/8':  DiT_MoM_L_8,
+    'DiT-MoM-B/2':  DiT_MoM_B_2,   'DiT-MoM-B/4':  DiT_MoM_B_4,   'DiT-MoM-B/8':  DiT_MoM_B_8,
+    'DiT-MoM-S/2':  DiT_MoM_S_2,   'DiT-MoM-S/4':  DiT_MoM_S_4,   'DiT-MoM-S/8':  DiT_MoM_S_8,
 }
+
+# Backward compatibility
+MoM = DiT_MoM
+MoM_models = DiT_MoM_models

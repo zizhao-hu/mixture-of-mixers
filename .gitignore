@@ -23,6 +23,7 @@ venv/
 assets/
 workdir/
 results/
+results_cls*/
 logs/
 *.pt
 *.pth

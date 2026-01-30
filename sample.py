@@ -1,8 +1,8 @@
-# Sampling script for DiT and MoM models.
+# Sampling script for DiT and DiT-MoM models.
 #
 # Usage:
-#   python sample.py --model DiT-S/4 --ckpt results/000-DiT-S-4/checkpoints/final.pt
-#   python sample.py --model MoM-S/4 --ckpt results/001-MoM-S-4/checkpoints/final.pt
+#   python sample.py --model DiT-S/2 --ckpt results/000-DiT-S-2/checkpoints/final.pt
+#   python sample.py --model DiT-MoM-S/2 --ckpt results/001-DiT-MoM-S-2/checkpoints/final.pt
 
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True

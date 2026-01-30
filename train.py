@@ -1,12 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
-# Unified training script for DiT and MoM models.
+# Unified training script for DiT and DiT-MoM models.
 # Supports single-GPU and multi-GPU (DDP) training.
 #
 # Usage:
-#   Single GPU:  python train.py --data-path /path/to/data --model DiT-S/4
-#   Multi-GPU:   torchrun --nproc_per_node=2 train.py --data-path /path/to/data --model MoM-S/4
+#   Single GPU:  python train.py --data-path /path/to/data --model DiT-S/2
+#   Multi-GPU:   torchrun --nproc_per_node=2 train.py --data-path /path/to/data --model DiT-MoM-S/2
 
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -199,7 +199,7 @@ def main(args):
     assert args.image_size % 8 == 0, "Image size must be divisible by 8"
     latent_size = args.image_size // 8
     
-    is_mom = args.model.startswith('MoM')
+    is_mom = 'MoM' in args.model  # Handles both 'MoM-S/2' and 'DiT-MoM-S/2'
     model = all_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
