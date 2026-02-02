@@ -59,14 +59,14 @@ def run_experiment(dataset, model, epochs, batch_size, lr, results_dir, quick=Fa
 
 
 def collect_results(results_dir):
-    """Collect results from all experiments."""
+    """Collect results from all experiments (recursive)."""
     results = {}
     
-    for exp_name in os.listdir(results_dir):
-        exp_path = os.path.join(results_dir, exp_name)
-        results_file = os.path.join(exp_path, 'results.json')
-        
-        if os.path.exists(results_file):
+    for root, dirs, files in os.walk(results_dir):
+        if 'results.json' in files:
+            results_file = os.path.join(root, 'results.json')
+            exp_name = os.path.relpath(root, results_dir).replace(os.sep, '_')
+            
             with open(results_file, 'r') as f:
                 data = json.load(f)
                 results[exp_name] = {
@@ -116,7 +116,7 @@ def main():
     parser.add_argument("--model", type=str, default=None, 
                         help="Specific model to run (overrides default list)")
     parser.add_argument("--quick", action="store_true", help="Quick test with 10 epochs")
-    parser.add_argument("--results-dir", type=str, default="./results_cls", 
+    parser.add_argument("--results-dir", type=str, default="./results/cls", 
                         help="Results directory")
     parser.add_argument("--collect-only", action="store_true", 
                         help="Only collect and print existing results")

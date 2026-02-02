@@ -37,7 +37,7 @@ import random
 import numpy as np
 from collections import OrderedDict
 
-from models import ViT_models, ViT_MoM_models
+from models import ViT_models, ViT_MoM_models, ViT_LMoM_models, ViT_SMoM_models
 
 
 #################################################################################
@@ -311,7 +311,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def create_logger(log_dir, rank=0):
+def create_logger(log_dir, rank=0, resume=False):
     """Create a logger that writes to a file and stdout."""
     import logging
     
@@ -321,7 +321,8 @@ def create_logger(log_dir, rank=0):
     
     if rank == 0:
         os.makedirs(log_dir, exist_ok=True)
-        handler = logging.FileHandler(os.path.join(log_dir, 'log.txt'))
+        mode = 'a' if resume else 'w'
+        handler = logging.FileHandler(os.path.join(log_dir, 'log.txt'), mode=mode)
         handler.setLevel(logging.INFO)
         formatter = logging.Formatter('%(asctime)s - %(message)s')
         handler.setFormatter(formatter)
@@ -384,11 +385,17 @@ def train_one_epoch(model, loader, optimizer, scheduler, device, epoch, is_mom,
         
         optimizer.step()
         
-        # Measure accuracy (use original targets for display)
-        if not use_mixup:
+        # Measure accuracy
+        if use_mixup:
+            # When using mixup, report accuracy against the dominant label
+            # (the one with the higher mixing coefficient)
+            targets_dominant = targets_a if lam > 0.5 else targets_b
+            acc1, acc5 = accuracy(logits, targets_dominant, topk=(1, 5))
+        else:
             acc1, acc5 = accuracy(logits, targets, topk=(1, 5))
-            top1.update(acc1.item(), images.size(0))
-            top5.update(acc5.item(), images.size(0))
+        
+        top1.update(acc1.item(), images.size(0))
+        top5.update(acc5.item(), images.size(0))
         
         losses.update(loss.item(), images.size(0))
         total_samples += images.size(0)
@@ -427,6 +434,63 @@ def evaluate(model, loader, device, is_mom, criterion):
     return losses.avg, top1.avg, top5.avg
 
 
+def get_num_params(model):
+    """Get total and active parameters."""
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Active parameters calculation for MoM/MoE models
+    active_params = 0
+    
+    # Simple recursive function to find MoM layers and calculate active params
+    def _count_active(module):
+        nonlocal active_params
+        if hasattr(module, 'num_experts') and hasattr(module, 'top_k') and hasattr(module, 'experts'):
+            # This is a MixtureOfMixers (top-k) layer
+            # Inactive = (num_experts - top_k) experts
+            if hasattr(module.experts, 'fc1_weight'):
+                # MLP experts (old)
+                expert_params = (module.experts.fc1_weight.numel() + 
+                                 module.experts.fc1_bias.numel() + 
+                                 module.experts.fc2_weight.numel() + 
+                                 module.experts.fc2_bias.numel())
+            elif hasattr(module.experts, 'fc1_tok_weight'):
+                # Unified (Bilinear) experts
+                expert_params = (module.experts.fc1_tok_weight.numel() + 
+                                 module.experts.fc1_chan_weight.numel() +
+                                 module.experts.fc1_bias.numel() +
+                                 module.experts.fc2_tok_weight.numel() +
+                                 module.experts.fc2_chan_weight.numel() +
+                                 module.experts.fc2_bias.numel())
+            elif hasattr(module.experts, 'weight'):
+                # Linear experts (N x N)
+                expert_params = (module.experts.weight.numel() + 
+                                 module.experts.bias.numel())
+            else:
+                expert_params = sum(p.numel() for p in module.experts.parameters())
+            
+            per_expert = expert_params // module.num_experts
+            inactive_per_layer = (module.num_experts - module.top_k) * per_expert
+            return inactive_per_layer
+        
+        elif hasattr(module, 'num_experts') and hasattr(module, 'slots_per_expert'):
+            # This is a SoftMixtureOfMixers layer
+            # All experts are technically active because it's soft, 
+            # but usually we report the "bottleneck" as active compute.
+            # However, for total parameter efficiency, all parameters are technically used.
+            # We'll treat all as active for Soft MoE unless otherwise specified.
+            return 0
+        
+        inactive = 0
+        for child in module.children():
+            inactive += _count_active(child)
+        return inactive
+
+    inactive_params = _count_active(model)
+    active_params = total_params - inactive_params
+    
+    return total_params, active_params
+
+
 #################################################################################
 #                                     Main                                       #
 #################################################################################
@@ -453,12 +517,14 @@ def main(args):
     
     # Create experiment directory
     model_name = args.model.replace('/', '-')
-    exp_name = f"{args.dataset}_{model_name}_e{args.epochs}"
-    if args.mixup:
-        exp_name += "_mixup"
-    if args.label_smoothing > 0:
-        exp_name += f"_ls{args.label_smoothing}"
-    exp_dir = os.path.join(args.results_dir, exp_name)
+    # Simplify model name as requested: no mixup, no ls
+    simple_model_name = f"{model_name}_e{args.epochs}"
+    
+    # Path: results/cls/<dataset>/<model>
+    dataset_name = args.dataset
+    if dataset_name.startswith('cifar'):
+        dataset_name = 'cifar'
+    exp_dir = os.path.join(args.results_dir, dataset_name, simple_model_name)
     
     if rank == 0:
         os.makedirs(exp_dir, exist_ok=True)
@@ -467,7 +533,7 @@ def main(args):
     if distributed:
         dist.barrier()
     
-    logger = create_logger(exp_dir, rank)
+    logger = create_logger(exp_dir, rank, resume=args.resume is not None)
     
     # Get dataset
     if args.dataset in ['cifar10', 'cifar100']:
@@ -514,7 +580,7 @@ def main(args):
     
     # Create model
     is_mom = 'MoM' in args.model
-    all_cls_models = {**ViT_models, **ViT_MoM_models}
+    all_cls_models = {**ViT_models, **ViT_MoM_models, **ViT_LMoM_models, **ViT_SMoM_models}
     
     model = all_cls_models[args.model](
         img_size=img_size,
@@ -526,11 +592,12 @@ def main(args):
     
     # Log model info
     if rank == 0:
-        num_params = sum(p.numel() for p in model.parameters())
+        total_params, active_params = get_num_params(model)
         logger.info(f"="*60)
-        logger.info(f"Experiment: {exp_name}")
+        logger.info(f"Experiment: {exp_dir}")
         logger.info(f"Model: {args.model}")
-        logger.info(f"Parameters: {num_params:,}")
+        logger.info(f"Total Parameters: {total_params:,}")
+        logger.info(f"Active Parameters: {active_params:,}")
         logger.info(f"Dataset: {args.dataset} ({num_classes} classes)")
         logger.info(f"Image size: {img_size}")
         logger.info(f"Batch size: {args.batch_size} x {world_size} = {args.batch_size * world_size}")
@@ -564,11 +631,29 @@ def main(args):
         min_lr=args.min_lr,
     )
     
-    # Training loop
+    # Resume from checkpoint
+    start_epoch = 0
     best_acc1 = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            if rank == 0:
+                logger.info(f"Loading checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location='cpu')
+            model.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            start_epoch = checkpoint['epoch']
+            best_acc1 = checkpoint.get('best_acc1', 0)
+            if rank == 0:
+                logger.info(f"Resumed from epoch {start_epoch} with best Acc@1 {best_acc1:.2f}%")
+        else:
+            if rank == 0:
+                logger.info(f"No checkpoint found at {args.resume}")
+    
+    # Training loop
     results = []
     
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
         
@@ -603,8 +688,8 @@ def main(args):
             result = {
                 'epoch': epoch + 1,
                 'train_loss': train_loss,
-                'train_acc1': train_acc1 if not args.mixup else 0,
-                'train_acc5': train_acc5 if not args.mixup else 0,
+                'train_acc1': train_acc1,
+                'train_acc5': train_acc5,
                 'val_loss': val_loss,
                 'val_acc1': val_acc1,
                 'val_acc5': val_acc5,
@@ -617,7 +702,7 @@ def main(args):
             log_msg = (
                 f"Epoch [{epoch+1}/{args.epochs}] "
                 f"LR={optimizer.param_groups[0]['lr']:.6f} | "
-                f"Train Loss={train_loss:.4f} | "
+                f"Train Loss={train_loss:.4f}, Acc@1={train_acc1:.2f}% | "
                 f"Val: Loss={val_loss:.4f}, Acc@1={val_acc1:.2f}%, Acc@5={val_acc5:.2f}% | "
                 f"Best={best_acc1:.2f}% | "
                 f"Speed={samples_per_sec:.1f} samples/s"
@@ -708,8 +793,9 @@ if __name__ == "__main__":
     # Misc
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--num-workers", type=int, default=4, help="Number of data workers")
-    parser.add_argument("--results-dir", type=str, default="./results_cls", help="Results directory")
+    parser.add_argument("--results-dir", type=str, default="./results/cls", help="Results directory")
     parser.add_argument("--save-every", type=int, default=50, help="Save checkpoint every N epochs")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     main(args)

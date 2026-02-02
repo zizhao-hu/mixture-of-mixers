@@ -21,7 +21,7 @@ MODEL=${2:-ViT-S/4}    # Model to run
 
 # Setup
 cd /project2/jessetho_1732/zizhaoh/mixture-of-mixers
-mkdir -p logs results_cls
+mkdir -p logs results/cls
 
 export CUDA_VISIBLE_DEVICES=0
 
@@ -47,7 +47,7 @@ python train_cls.py \
     --batch-size 128 \
     --lr 1e-3 \
     --num-workers 4 \
-    --results-dir ./results_cls
+    --results-dir ./results/cls
 
 echo "============================================"
 echo "Training Complete: $(date)"
